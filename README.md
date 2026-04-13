@@ -1,7 +1,5 @@
 # 自动打标签部署说明
 
-仓库地址已固定为：
-`https://github.com/ezhu0000/aws-auto-resource-tagging.git`
 
 ## 在 AWS CloudShell 部署
 
