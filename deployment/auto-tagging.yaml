@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Daily EventBridge-triggered Lambda that uses AWS Resource Explorer to find
+  taggable resources missing required tag keys, then applies default tags in
+  batch with the Resource Groups Tagging API.
+  Prerequisite: Resource Explorer must be enabled and the selected view must
+  include tags in IncludedProperties.
+
+# Parameters
+Parameters:
+  RequiredTagMapJson:
+    Type: String
+    Default: '{"map-migrated":"migTPMCT-DEMO"}'
+    Description: >
+      JSON object of required tags and default values, for example:
+      {"TagOwner":"CDS-MAP","map-migrated":"migTPMCT-DEMO","Environment":"Prod"}.
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+    Description: EventBridge schedule expression, e.g. rate(1 day) or cron(0 2 * * ? *).
+
+  ResourceExplorerViewArn:
+    Type: String
+    Default: ""
+    Description: >
+      Optional custom Resource Explorer view ARN.
+      If empty, the Region default view is used.
+      The view must include tags in IncludedProperties.
+
+  CreateResourceExplorerSetup:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Whether this stack should also create Resource Explorer index and view.
+      Set to false if your account already has an index configured.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 180, 365]
+    Description: CloudWatch Logs retention in days.
+
+# Conditions
+Conditions:
+  HasCustomView: !Not [!Equals [!Ref ResourceExplorerViewArn, ""]]
+  CreateExplorerSetup: !Equals [!Ref CreateResourceExplorerSetup, "true"]
+
+# Resources
+Resources:
+
+  # Optional: create Resource Explorer index/view.
+  AutoTaggingExplorerIndex:
+    Type: AWS::ResourceExplorer2::Index
+    Condition: CreateExplorerSetup
+    Properties:
+      Type: AGGREGATOR
+
+  AutoTaggingExplorerView:
+    Type: AWS::ResourceExplorer2::View
+    Condition: CreateExplorerSetup
+    DependsOn: AutoTaggingExplorerIndex
+    Properties:
+      ViewName: !Sub auto-tagging-view-${AWS::StackName}
+      IncludedProperties:
+        - Name: tags
+
+  AutoTaggingDefaultViewAssociation:
+    Type: AWS::ResourceExplorer2::DefaultViewAssociation
+    Condition: CreateExplorerSetup
+    DependsOn: AutoTaggingExplorerView
+    Properties:
+      ViewArn: !GetAtt AutoTaggingExplorerView.ViewArn
+
+  # IAM Role
+  AutoTaggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub AutoTagging-MAP-Role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AutoTaggingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ResourceExplorerSearch
+                Effect: Allow
+                Action:
+                  - resource-explorer-2:Search
+                Resource: "*"
+              - Sid: TaggingApi
+                Effect: Allow
+                Action:
+                  - tag:TagResources
+                  - tag:GetResources
+                Resource: "*"
+
+  # CloudWatch Log Group (created before Lambda to control retention)
+  AutoTaggingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/AutoResourceTagging-MAP
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda Function
+  AutoTaggingFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AutoTaggingLogGroup
+    Properties:
+      FunctionName: AutoResourceTagging-MAP
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoTaggingRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          TAG_DEFAULTS_JSON: !Ref RequiredTagMapJson
+          VIEW_ARN: !If
+            - CreateExplorerSetup
+            - !GetAtt AutoTaggingExplorerView.ViewArn
+            - !If [HasCustomView, !Ref ResourceExplorerViewArn, ""]
+      Code:
+        ZipFile: |
+          import os, json, logging
+          from datetime import datetime, timezone
+          import boto3
+          from botocore.exceptions import ClientError
+
+          LOG = logging.getLogger()
+          LOG.setLevel(logging.INFO)
+          EXPLORER = boto3.client('resource-explorer-2')
+          TAGGING  = boto3.client('resourcegroupstaggingapi')
+          BATCH    = 20
+
+          def required_keys():
+              raw_map = os.environ.get('TAG_DEFAULTS_JSON', '{}')
+              try:
+                  parsed = json.loads(raw_map)
+                  if isinstance(parsed, dict):
+                      return [str(k).strip() for k in parsed.keys() if str(k).strip()]
+              except Exception:
+                  pass
+              return []
+
+          def build_tags(keys):
+              tags = {}
+              raw = os.environ.get('TAG_DEFAULTS_JSON', '')
+              if raw:
+                  try: tags.update(json.loads(raw))
+                  except Exception: pass
+              missing = [k for k in keys if not tags.get(k)]
+              if missing:
+                  raise ValueError('No default value for: ' + ', '.join(missing))
+              tags['AutoTagged'] = 'true'
+              tags['TaggedDate'] = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              return tags
+
+          def search_arns(query, view_arn):
+              arns, token = set(), None
+              while True:
+                  kw = {'QueryString': query, 'MaxResults': 1000}
+                  if view_arn: kw['ViewArn'] = view_arn
+                  if token:    kw['NextToken'] = token
+                  try:
+                      r = EXPLORER.search(**kw)
+                  except ClientError as e:
+                      LOG.error('search error: %s', e); raise
+                  for res in r.get('Resources', []):
+                      arn = res.get('Arn') or res.get('ARN')
+                      if arn: arns.add(arn)
+                  token = r.get('NextToken')
+                  if not token: break
+              return arns
+
+          def tag_batches(arns, tags):
+              for i in range(0, len(arns), BATCH):
+                  batch = arns[i:i+BATCH]
+                  try:
+                      r = TAGGING.tag_resources(ResourceARNList=batch, Tags=tags)
+                      for arn, info in (r.get('FailedResourcesMap') or {}).items():
+                          LOG.warning('tag failed %s: %s', arn, info)
+                  except ClientError as e:
+                      LOG.error('tag_resources error: %s', e)
+
+          def lambda_handler(event, context):
+              keys   = required_keys()
+              if not keys:
+                  return {'statusCode': 400, 'body': 'No required tag keys configured'}
+              view   = os.environ.get('VIEW_ARN') or None
+              try:
+                  tags = build_tags(keys)
+              except ValueError as e:
+                  LOG.error('%s', e)
+                  return {'statusCode': 400, 'body': str(e)}
+              merged = set()
+              for k in keys:
+                  q     = 'resourcetype.supports:tags -tag.key:' + k
+                  found = search_arns(q, view)
+                  LOG.info('key=%s matched=%d', k, len(found))
+                  merged |= found
+              arns = sorted(merged)
+              LOG.info('total_arns=%d tags=%s', len(arns), list(tags.keys()))
+              if arns:
+                  tag_batches(arns, tags)
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'tagged': len(arns), 'keys': keys})
+              }
+
+  # Daily EventBridge schedule
+  TaggingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub auto-resource-tagging-daily-${AWS::StackName}
+      Description: Daily auto-tagging via Resource Explorer + Tagging API
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoTaggingFunction.Arn
+          Id: AutoTaggingTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AutoTaggingFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TaggingScheduleRule.Arn
+
+# Outputs
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the auto-tagging Lambda function.
+    Value: !GetAtt AutoTaggingFunction.Arn
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function.
+    Value: !Ref AutoTaggingFunction
+
+  EventRuleArn:
+    Description: ARN of the EventBridge rule.
+    Value: !GetAtt TaggingScheduleRule.Arn
+
+  ExplorerViewArn:
+    Condition: CreateExplorerSetup
+    Description: Resource Explorer view ARN created by this stack.
+    Value: !GetAtt AutoTaggingExplorerView.ViewArn
