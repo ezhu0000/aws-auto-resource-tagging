@@ -13,10 +13,12 @@ cd aws-auto-resource-tagging
 2. 部署堆栈：
 
 ```bash
+# 注意：你可能需要传入自己的 RequiredTagMapJson 参数。
 aws cloudformation deploy \
   --template-file auto-tagging.yaml \
   --stack-name auto-map-tag \
-  --capabilities CAPABILITY_NAMED_IAM
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides RequiredTagMapJson='{"TagOwner":"你的值"}'
 ```
 
 3. （可选）传入自定义参数：
