@@ -108,12 +108,6 @@ Resources:
                 Action:
                   - s3:GetBucketTagging
                 Resource: "*"
-              - Sid: CloudFormationTaggingRead
-                Effect: Allow
-                Action:
-                  - cloudformation:DescribeStacks
-                  - cloudformation:UpdateStack
-                Resource: "*"
               - Sid: IamTagging
                 Effect: Allow
                 Action:
@@ -138,7 +132,6 @@ Resources:
                   - aoss:TagResource
                   - athena:TagResource
                   - backup:TagResource
-                  - cloudformation:TagResource
                   - cloudfront:TagResource
                   - cloudtrail:AddTags
                   - cloudwatch:TagResource
@@ -218,7 +211,7 @@ Resources:
           # ARN 第 3 段 (service)；须与 README 附录一致。扩展打标范围时同步改 IAM ServiceTagResourceDelegation / IamTagging。
           ALLOWED_ARN_SERVICES = frozenset({
               'acm', 'apigateway', 'apprunner', 'aoss', 'athena', 'backup',
-              'cloudformation', 'cloudfront', 'cloudtrail', 'cloudwatch', 'connect',
+              'cloudfront', 'cloudtrail', 'cloudwatch', 'connect',
               'dynamodb', 'ec2', 'ecr', 'ecs', 'eks', 'es', 'elasticache',
               'elasticbeanstalk', 'elasticfilesystem', 'elasticloadbalancing',
               'elasticmapreduce', 'events', 'firehose', 'fsx', 'glue', 'kafka',
