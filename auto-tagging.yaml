@@ -103,6 +103,16 @@ Resources:
                   - tag:TagResources
                   - tag:GetResources
                 Resource: "*"
+              - Sid: S3BucketTaggingRead
+                Effect: Allow
+                Action:
+                  - s3:GetBucketTagging
+                Resource: "*"
+              - Sid: CloudFormationTaggingRead
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: "*"
               - Sid: IamTagging
                 Effect: Allow
                 Action:
@@ -195,7 +205,7 @@ Resources:
             - !If [HasCustomView, !Ref ResourceExplorerViewArn, ""]
       Code:
         ZipFile: |
-          import os, json, logging
+          import os, json, logging, time
           from datetime import datetime, timezone
           import boto3
           from botocore.exceptions import ClientError
@@ -228,6 +238,25 @@ Resources:
           def arn_service_allowed(arn):
               svc = service_from_arn(arn)
               return bool(svc) and svc in ALLOWED_ARN_SERVICES
+
+          def arn_skip_known_bad(arn):
+              """Skip ARNs that consistently fail unified tagging (pseudo-resources, SLR, managed rules)."""
+              if not arn:
+                  return True
+              svc = service_from_arn(arn)
+              lo = arn.lower()
+              if svc == 'athena' and 'datacatalog/awsdatacatalog' in lo:
+                  return True
+              if svc == 'elasticache' and ':user:' in arn:
+                  return True
+              if svc == 'memorydb' and ':cluster/' not in arn:
+                  return True
+              if svc == 'events' and '/rule/' in arn:
+                  if 'connectcampaignsrule' in lo or 'managed.connect' in lo:
+                      return True
+              if svc == 's3' and 'storage-lens' in lo:
+                  return True
+              return False
 
           def get_tagging_client(region):
               if region not in _tagging_clients:
@@ -294,13 +323,34 @@ Resources:
               for region, region_arns in by_region.items():
                   tagging = get_tagging_client(region)
                   for i in range(0, len(region_arns), BATCH):
-                      batch = region_arns[i:i+BATCH]
-                      try:
-                          r = tagging.tag_resources(ResourceARNList=batch, Tags=tags)
-                          for arn, info in (r.get('FailedResourcesMap') or {}).items():
-                              LOG.warning('tag failed %s: %s', arn, info)
-                      except ClientError as e:
-                          LOG.error('tag_resources error (region=%s): %s', region, e)
+                      pending = region_arns[i:i+BATCH]
+                      backoff = 0.35
+                      for attempt in range(5):
+                          try:
+                              r = tagging.tag_resources(ResourceARNList=pending, Tags=tags)
+                              failed = r.get('FailedResourcesMap') or {}
+                              throttled = [x for x, inf in failed.items() if inf.get('ErrorCode') == 'Throttling']
+                              for x, inf in failed.items():
+                                  if inf.get('ErrorCode') != 'Throttling':
+                                      LOG.warning('tag failed %s: %s', x, inf)
+                              if not throttled:
+                                  break
+                              if attempt >= 4:
+                                  for x in throttled:
+                                      LOG.warning('tag failed %s: %s', x, failed.get(x))
+                                  break
+                              time.sleep(backoff)
+                              backoff = min(backoff * 2, 8.0)
+                              pending = throttled
+                          except ClientError as e:
+                              code = (e.response.get('Error') or {}).get('Code', '')
+                              if code in ('Throttling', 'TooManyRequestsException', 'RequestLimitExceeded') and attempt < 4:
+                                  time.sleep(backoff)
+                                  backoff = min(backoff * 2, 8.0)
+                                  continue
+                              LOG.error('tag_resources error (region=%s): %s', region, e)
+                              break
+                      time.sleep(0.08)
 
           def lambda_handler(event, context):
               keys   = required_keys()
@@ -319,18 +369,23 @@ Resources:
                   LOG.info('key=%s matched=%d', k, len(found))
                   merged |= found
               arns = sorted(merged)
-              kept = [a for a in arns if arn_service_allowed(a)]
-              skipped = len(arns) - len(kept)
-              if skipped:
-                  LOG.info('allowlist skipped %d arns (service not in README appendix)', skipped)
-              LOG.info('total_matched=%d after_allowlist=%d tags=%s', len(arns), len(kept), list(tags.keys()))
+              allow = [a for a in arns if arn_service_allowed(a)]
+              skipped_allow = len(arns) - len(allow)
+              kept = [a for a in allow if not arn_skip_known_bad(a)]
+              skipped_bad = len(allow) - len(kept)
+              if skipped_allow:
+                  LOG.info('allowlist skipped %d arns (service not in README appendix)', skipped_allow)
+              if skipped_bad:
+                  LOG.info('skip_known_bad skipped %d arns (see README)', skipped_bad)
+              LOG.info('total_matched=%d after_allowlist=%d after_skip_bad=%d tags=%s', len(arns), len(allow), len(kept), list(tags.keys()))
               if kept:
                   tag_batches(kept, tags)
               return {
                   'statusCode': 200,
                   'body': json.dumps({
                       'matched': len(arns),
-                      'skipped_not_in_allowlist': skipped,
+                      'skipped_not_in_allowlist': skipped_allow,
+                      'skipped_known_bad_pattern': skipped_bad,
                       'tagged': len(kept),
                       'keys': keys,
                   })
