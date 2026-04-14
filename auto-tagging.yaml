@@ -115,6 +115,58 @@ Resources:
                   - iam:TagServerCertificate
                   - iam:TagMFADevice
                 Resource: "*"
+              # tag:TagResources calls each service's tagging API (names differ). OpenSearch managed domains: es:AddTags; Serverless collections: aoss:TagResource.
+              # EC2/VPC: ec2:CreateTags. "Data Transfer" / "Cost Explorer" in CUR are billing lines, not ARNs—tag underlying resources instead.
+              - Sid: ServiceTagResourceDelegation
+                Effect: Allow
+                Action:
+                  - acm:AddTagsToCertificate
+                  - apigateway:TagResource
+                  - apigatewayv2:TagResource
+                  - apprunner:TagResource
+                  - aoss:TagResource
+                  - athena:TagResource
+                  - backup:TagResource
+                  - cloudformation:TagResource
+                  - cloudfront:TagResource
+                  - cloudtrail:AddTags
+                  - cloudwatch:TagResource
+                  - connect:TagResource
+                  - dynamodb:TagResource
+                  - ec2:CreateTags
+                  - ecr:TagResource
+                  - ecs:TagResource
+                  - eks:TagResource
+                  - es:AddTags
+                  - elasticache:AddTagsToResource
+                  - elasticbeanstalk:AddTags
+                  - elasticfilesystem:TagResource
+                  - elasticloadbalancing:AddTags
+                  - emr:AddTags
+                  - events:TagResource
+                  - firehose:TagDeliveryStream
+                  - fsx:TagResource
+                  - glue:TagResource
+                  - kafka:TagResource
+                  - kinesis:AddTagsToStream
+                  - kms:TagResource
+                  - lambda:TagResource
+                  - logs:TagLogGroup
+                  - logs:TagResource
+                  - memorydb:TagResource
+                  - mq:TagResource
+                  - ram:TagResource
+                  - rds:AddTagsToResource
+                  - redshift:CreateTags
+                  - s3:PutBucketTagging
+                  - sagemaker:AddTags
+                  - secretsmanager:TagResource
+                  - sns:TagResource
+                  - sqs:TagQueue
+                  - ssm:AddTagsToResource
+                  - states:TagResource
+                  - wafv2:TagResource
+                Resource: "*"
 
   # CloudWatch Log Group (created before Lambda to control retention)
   AutoTaggingLogGroup:
@@ -153,6 +205,29 @@ Resources:
           EXPLORER = boto3.client('resource-explorer-2')
           BATCH    = 20
           _tagging_clients = {}
+          # ARN 第 3 段 (service)；须与 README 附录一致。扩展打标范围时同步改 IAM ServiceTagResourceDelegation / IamTagging。
+          ALLOWED_ARN_SERVICES = frozenset({
+              'acm', 'apigateway', 'apprunner', 'aoss', 'athena', 'backup',
+              'cloudformation', 'cloudfront', 'cloudtrail', 'cloudwatch', 'connect',
+              'dynamodb', 'ec2', 'ecr', 'ecs', 'eks', 'es', 'elasticache',
+              'elasticbeanstalk', 'elasticfilesystem', 'elasticloadbalancing',
+              'elasticmapreduce', 'events', 'firehose', 'fsx', 'glue', 'kafka',
+              'kinesis', 'kms', 'lambda', 'logs', 'memorydb', 'mq', 'ram', 'rds',
+              'redshift', 's3', 'sagemaker', 'secretsmanager', 'sns', 'sqs', 'ssm',
+              'states', 'wafv2', 'iam',
+          })
+
+          def service_from_arn(arn):
+              if not arn or not isinstance(arn, str):
+                  return None
+              parts = arn.split(':')
+              if len(parts) < 3:
+                  return None
+              return parts[2].lower()
+
+          def arn_service_allowed(arn):
+              svc = service_from_arn(arn)
+              return bool(svc) and svc in ALLOWED_ARN_SERVICES
 
           def get_tagging_client(region):
               if region not in _tagging_clients:
@@ -244,12 +319,21 @@ Resources:
                   LOG.info('key=%s matched=%d', k, len(found))
                   merged |= found
               arns = sorted(merged)
-              LOG.info('total_arns=%d tags=%s', len(arns), list(tags.keys()))
-              if arns:
-                  tag_batches(arns, tags)
+              kept = [a for a in arns if arn_service_allowed(a)]
+              skipped = len(arns) - len(kept)
+              if skipped:
+                  LOG.info('allowlist skipped %d arns (service not in README appendix)', skipped)
+              LOG.info('total_matched=%d after_allowlist=%d tags=%s', len(arns), len(kept), list(tags.keys()))
+              if kept:
+                  tag_batches(kept, tags)
               return {
                   'statusCode': 200,
-                  'body': json.dumps({'tagged': len(arns), 'keys': keys})
+                  'body': json.dumps({
+                      'matched': len(arns),
+                      'skipped_not_in_allowlist': skipped,
+                      'tagged': len(kept),
+                      'keys': keys,
+                  })
               }
 
   # Daily EventBridge schedule
