@@ -108,11 +108,10 @@ Resources:
                 Action:
                   - s3:GetBucketTagging
                 Resource: "*"
-              - Sid: CloudFormationStackTagging
+              - Sid: CloudFormationTaggingRead
                 Effect: Allow
                 Action:
                   - cloudformation:DescribeStacks
-                  - cloudformation:UpdateStack
                 Resource: "*"
               - Sid: IamTagging
                 Effect: Allow
@@ -251,8 +250,7 @@ Resources:
                   return True
               if svc == 'memorydb' and ':cluster/' not in arn:
                   return True
-              # EventBridge ARNs use :rule/name (no slash before "rule")
-              if svc == 'events' and ':rule/' in arn:
+              if svc == 'events' and '/rule/' in arn:
                   if 'connectcampaignsrule' in lo or 'managed.connect' in lo:
                       return True
               if svc == 's3' and 'storage-lens' in lo:
