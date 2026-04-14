@@ -103,6 +103,18 @@ Resources:
                   - tag:TagResources
                   - tag:GetResources
                 Resource: "*"
+              - Sid: IamTagging
+                Effect: Allow
+                Action:
+                  - iam:TagPolicy
+                  - iam:TagRole
+                  - iam:TagUser
+                  - iam:TagInstanceProfile
+                  - iam:TagSAMLProvider
+                  - iam:TagOpenIDConnectProvider
+                  - iam:TagServerCertificate
+                  - iam:TagMFADevice
+                Resource: "*"
 
   # CloudWatch Log Group (created before Lambda to control retention)
   AutoTaggingLogGroup:
@@ -139,8 +151,22 @@ Resources:
           LOG = logging.getLogger()
           LOG.setLevel(logging.INFO)
           EXPLORER = boto3.client('resource-explorer-2')
-          TAGGING  = boto3.client('resourcegroupstaggingapi')
           BATCH    = 20
+          _tagging_clients = {}
+
+          def get_tagging_client(region):
+              if region not in _tagging_clients:
+                  _tagging_clients[region] = boto3.client('resourcegroupstaggingapi', region_name=region)
+              return _tagging_clients[region]
+
+          def region_from_arn(arn):
+              # arn:partition:service:region:account:resource
+              parts = arn.split(':')
+              if len(parts) >= 4:
+                  r = parts[3]
+                  # Global services (IAM, etc.) have an empty region field; use us-east-1
+                  return r if r else 'us-east-1'
+              return None
 
           def required_keys():
               raw_map = os.environ.get('TAG_DEFAULTS_JSON', '{}')
@@ -183,14 +209,23 @@ Resources:
               return arns
 
           def tag_batches(arns, tags):
-              for i in range(0, len(arns), BATCH):
-                  batch = arns[i:i+BATCH]
-                  try:
-                      r = TAGGING.tag_resources(ResourceARNList=batch, Tags=tags)
-                      for arn, info in (r.get('FailedResourcesMap') or {}).items():
-                          LOG.warning('tag failed %s: %s', arn, info)
-                  except ClientError as e:
-                      LOG.error('tag_resources error: %s', e)
+              by_region = {}
+              for arn in arns:
+                  region = region_from_arn(arn)
+                  if region:
+                      by_region.setdefault(region, []).append(arn)
+                  else:
+                      LOG.warning('Cannot determine region for ARN, skipping: %s', arn)
+              for region, region_arns in by_region.items():
+                  tagging = get_tagging_client(region)
+                  for i in range(0, len(region_arns), BATCH):
+                      batch = region_arns[i:i+BATCH]
+                      try:
+                          r = tagging.tag_resources(ResourceARNList=batch, Tags=tags)
+                          for arn, info in (r.get('FailedResourcesMap') or {}).items():
+                              LOG.warning('tag failed %s: %s', arn, info)
+                      except ClientError as e:
+                          LOG.error('tag_resources error (region=%s): %s', region, e)
 
           def lambda_handler(event, context):
               keys   = required_keys()
